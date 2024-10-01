@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from langchain_ollama.llms import OllamaLLM
 from utils.pdf_preprocessing import PdfPreprocessor
-from utils.retriver import get_retriever
+from utils.retriver import get_retriever, get_unique_docs
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 import os
@@ -11,6 +11,7 @@ import chromadb
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain.prompts import ChatPromptTemplate
+from operator import itemgetter
 
 ALLOWED_EXTENSIONS = {'pdf'}
 DB_DIRECTORY = os.path.curdir + "/chroma.sqlite3"
@@ -25,7 +26,7 @@ def create_app():
 
 app = create_app()
 
-llm  = OllamaLLM(model="llama3.2:3b", base_url="http://localhost:11434")
+llm  = OllamaLLM(model="llama3.2:3b", base_url="http://localhost:11434", temperature=0)
 
 embedding_model = OllamaEmbeddings(
     model="nomic-embed-text:latest",
@@ -33,8 +34,8 @@ embedding_model = OllamaEmbeddings(
 
 client = chromadb.HttpClient(host='localhost', port=8000)
 
-@app.route('/ai', methods=["POST"])
-def modelPost():
+@app.route('/ai/simple', methods=["POST"])
+def simplePost():
     json_content = request.json
     retriever = get_retriever(embedding_model, client, "nutritient")
     template = """Answer the question based only on the following context:
@@ -55,6 +56,79 @@ def modelPost():
     
     response = {"Question": json_content['query'], "Anwer": llm_response}
     return jsonify(response)
+
+@app.route('/ai/multi_query', methods=["POST"])
+def multiQueryPost():
+    try:
+        json_content = request.json
+        retriever = get_retriever(embedding_model, client, "nutritient")
+
+        query_generation_template = """You are an AI language model assistant. Your task is to generate five 
+                    different versions of the given user question to retrieve relevant documents from a vector 
+                    database. By generating multiple perspectives on the user question, your goal is to help
+                    the user overcome some of the limitations of the distance-based similarity search. 
+                    Provide these alternative questions separated by newlines. Original question: {question}"""
+        query_generation_prompt = ChatPromptTemplate.from_template(query_generation_template)
+        
+        queries_chain = (
+            {"question": itemgetter("query")}
+            | query_generation_prompt
+            | llm
+            | StrOutputParser()
+            | (lambda x: x.split("\n"))
+            | (lambda x: [query for query in x if query.strip() != ''])
+            | (lambda x: [line for line in x if line.strip().startswith(('1.', '2.', '3.', '4.', '5.'))])
+        )
+        
+        retrieval_chain = (
+            queries_chain 
+            | retriever.map()
+            | (lambda docs: [doc for sublist in docs for doc in sublist])  # Flatten list of lists
+            | get_unique_docs
+        )
+        
+        base_prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:
+        {context}
+
+        Question: {question}
+        """)
+        
+        def format_docs(docs):
+            return "\n".join([f"Document {i+1}:\n{doc.page_content}\n" for i, doc in enumerate(docs)])
+        
+        final_rag_chain = (
+            {
+                "context": lambda x: format_docs(x["context"]),
+                "question": itemgetter("query")
+            }
+            | base_prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        # Generate additional questions
+        additional_questions = queries_chain.invoke(json_content)
+        
+        # Retrieve documents
+        retrieved_docs = retrieval_chain.invoke(json_content)
+        print(len(retrieved_docs))
+        # Generate final answer
+        llm_response = final_rag_chain.invoke({"query": json_content['query'], "context": retrieved_docs})
+        
+        response = {
+            "Original_Question": json_content['query'],
+            "Generated_Questions": additional_questions,
+            "Retrieved_Context": [
+                {
+                    "content": doc.page_content,
+                    "metadata": doc.metadata
+                } for doc in retrieved_docs
+            ],
+            "Answer": llm_response
+        }
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/pdf', methods = ["POST"])
 def method_name():
