@@ -1,0 +1,7 @@
+ragas
+chromadb
+langchain
+langchain-ollama
+flask
+PyMuPDF
+langchain-chroma
