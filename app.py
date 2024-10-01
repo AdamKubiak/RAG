@@ -81,17 +81,18 @@ def multiQueryPost():
         )
         
         retrieval_chain = (
-            queries_chain 
-            | retriever.map()
+            retriever.map()
             | (lambda docs: [doc for sublist in docs for doc in sublist])  # Flatten list of lists
             | get_unique_docs
         )
         
-        base_prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:
+        base_prompt = ChatPromptTemplate.from_template(
+        """Answer the question based only on the following context. Use all documents as context:
         {context}
 
         Question: {question}
-        """)
+        """
+        )
         
         def format_docs(docs):
             return "\n".join([f"Document {i+1}:\n{doc.page_content}\n" for i, doc in enumerate(docs)])
@@ -108,10 +109,9 @@ def multiQueryPost():
         
         # Generate additional questions
         additional_questions = queries_chain.invoke(json_content)
-        
+        additional_questions.append(f'6. {json_content['query']}')
         # Retrieve documents
-        retrieved_docs = retrieval_chain.invoke(json_content)
-        print(len(retrieved_docs))
+        retrieved_docs = retrieval_chain.invoke(additional_questions)
         # Generate final answer
         llm_response = final_rag_chain.invoke({"query": json_content['query'], "context": retrieved_docs})
         
