@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify
 from langchain_ollama.llms import OllamaLLM
 from utils.pdf_preprocessing import PdfPreprocessor
-from utils.retriver import get_retriever, get_unique_docs
+from utils.retriver import get_retriever, get_unique_docs, reciprocal_rank_fusion, format_qa_pair
+from utils.prompts import base_prompt, query_generation_template, query_decomposition_template, query_COT_template, base_prompt_decomposition
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 import os
@@ -57,17 +58,134 @@ def simplePost():
     response = {"Question": json_content['query'], "Anwer": llm_response}
     return jsonify(response)
 
+@app.route('/ai/multi_query_fusion', methods=["POST"])
+def queryFusion():
+    try:
+        json_content = request.json
+        retriever = get_retriever(embedding_model, client, "nutritient")
+
+        query_generation_prompt = ChatPromptTemplate.from_template(query_generation_template)
+        
+        queries_chain = (
+            {"question": itemgetter("query")}
+            | query_generation_prompt
+            | llm
+            | StrOutputParser()
+            | (lambda x: x.split("\n"))
+            | (lambda x: [query for query in x if query.strip() != ''])
+            | (lambda x: [line for line in x if line.strip().startswith(('1.', '2.', '3.', '4.', '5.'))])
+        )
+        
+        retrieval_chain = (
+            retriever.map()
+            | reciprocal_rank_fusion
+        )
+        
+        def format_docs(docs):
+            return "\n".join([f"Document {i+1}:\n{doc[0].page_content}\n" for i, doc in enumerate(docs)])
+        
+        query_base = ChatPromptTemplate.from_template(base_prompt)
+        
+        final_rag_chain = (
+            {
+                "context": lambda x: format_docs(x["context"]),
+                "question": itemgetter("query")
+            }
+            | query_base
+            | llm
+            | StrOutputParser()
+        )
+        
+        # Generate additional questions
+        additional_questions = queries_chain.invoke({"query": json_content["query"]})
+        additional_questions.append(f'6. {json_content["query"]}')
+        
+        # Retrieve documents
+        retrieved_docs = retrieval_chain.invoke(additional_questions)
+        retrieved_docs = retrieved_docs[:3]
+        llm_response = final_rag_chain.invoke({"query": json_content["query"], "context": retrieved_docs})
+        
+        response = {
+            "Original_Question": json_content["query"],
+            "Generated_Questions": additional_questions,
+            "Retrieved_Context": [
+                {
+                    "content": doc[0].page_content,
+                    "metadata": doc[0].metadata,
+                    "score": doc[1]
+                } for doc in retrieved_docs
+            ],
+            "Answer": llm_response
+        }
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/ai/decomposition_fusion', methods=["POST"])
+def queryDecompositionCOT():
+    try:
+        json_content = request.json
+        retriever = get_retriever(embedding_model, client, "nutritient")
+
+        query_generation_prompt = ChatPromptTemplate.from_template(query_decomposition_template)
+        decompositon_prompt = ChatPromptTemplate.from_template(query_COT_template)
+        queries_chain = (
+            {"question": itemgetter("query")}
+            | query_generation_prompt
+            | llm
+            | StrOutputParser()
+            | (lambda x: x.split("\n"))
+            | (lambda x: [query for query in x if query.strip() != ''])
+            | (lambda x: [line for line in x if line.strip().startswith(('1.', '2.', '3.', '4.', '5.'))])
+        )
+        
+        # Generate additional questions
+        additional_questions = queries_chain.invoke({"query": json_content["query"]})
+        q_a_pairs = ""
+        for q in additional_questions:
+            rag_chain = (
+                {"context": itemgetter("question") | retriever,
+                 "question": itemgetter("question"), "q_a_pairs": itemgetter("q_a_pairs")}
+                | decompositon_prompt
+                | llm
+                | StrOutputParser()
+            )
+            print(q)
+            answer = rag_chain.invoke({"question": q, "q_a_pairs": q_a_pairs})
+            q_a_pair = format_qa_pair(q,answer)
+            q_a_pairs = q_a_pairs + "\n---\n"+  q_a_pair
+        
+        final_prompt = ChatPromptTemplate.from_template(base_prompt_decomposition)
+        
+        rag_chain = (
+            {
+                "context": RunnablePassthrough(),
+                "question": RunnablePassthrough() 
+            }
+            | final_prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        final_anwer = rag_chain.invoke({"context": q_a_pair, "question": json_content['query']})
+        
+        response = {
+            "Original_Question": json_content["query"],
+            "Generated_Questions": additional_questions,
+            "Answer": final_anwer,
+            "context": q_a_pairs
+        }
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/ai/multi_query', methods=["POST"])
 def multiQueryPost():
     try:
         json_content = request.json
         retriever = get_retriever(embedding_model, client, "nutritient")
 
-        query_generation_template = """You are an AI language model assistant. Your task is to generate five 
-                    different versions of the given user question to retrieve relevant documents from a vector 
-                    database. By generating multiple perspectives on the user question, your goal is to help
-                    the user overcome some of the limitations of the distance-based similarity search. 
-                    Provide these alternative questions separated by newlines. Original question: {question}"""
+        
         query_generation_prompt = ChatPromptTemplate.from_template(query_generation_template)
         
         queries_chain = (
@@ -86,23 +204,17 @@ def multiQueryPost():
             | get_unique_docs
         )
         
-        base_prompt = ChatPromptTemplate.from_template(
-        """Answer the question based only on the following context. Use all documents as context:
-        {context}
-
-        Question: {question}
-        """
-        )
-        
         def format_docs(docs):
             return "\n".join([f"Document {i+1}:\n{doc.page_content}\n" for i, doc in enumerate(docs)])
+        
+        query_base = ChatPromptTemplate.from_template(base_prompt)
         
         final_rag_chain = (
             {
                 "context": lambda x: format_docs(x["context"]),
                 "question": itemgetter("query")
             }
-            | base_prompt
+            | query_base
             | llm
             | StrOutputParser()
         )
@@ -172,7 +284,6 @@ def method_name():
 def dbGet():
     collections = client.list_collections()
     print(collections)
-
     # Convert collections to a JSON serializable format
     serializable_collections = []
     for collection in collections:
@@ -181,6 +292,8 @@ def dbGet():
             'id': collection.id 
         })
     count_in_collection = client.get_collection("nutritient").count()
+    
+    
 
     return jsonify({"collections": serializable_collections,
                     "count": count_in_collection})
