@@ -2,12 +2,13 @@ from flask import Flask, request, jsonify
 from langchain_ollama.llms import OllamaLLM
 from utils.pdf_preprocessing import PdfPreprocessor
 from utils.retriver import get_retriever, get_unique_docs, reciprocal_rank_fusion, format_qa_pair
-from utils.prompts import base_prompt, query_generation_template, query_decomposition_template, query_COT_template, base_prompt_decomposition
+from utils.prompts import base_prompt, query_generation_template, query_decomposition_template, query_COT_template, base_prompt_decomposition, router_template
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 import os
 from time import perf_counter
 import chromadb
+import requests
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -34,6 +35,42 @@ embedding_model = OllamaEmbeddings(
 )
 
 client = chromadb.HttpClient(host='localhost', port=8000)
+
+@app.route('/ai/llm_route_question', methods=["POST"])
+def llm_route_question():
+    try:
+        router_prompt = ChatPromptTemplate.from_template(router_template)
+
+        router_chain = (
+            router_prompt
+            | llm
+            | StrOutputParser()
+        )
+        json_content = request.json
+        question = json_content['query']
+        
+        # Use the LLM to decide the routing
+        method = router_chain.invoke({"question": question}).strip()
+        
+        base_url = request.url_root  # This gets the root URL of your Flask app
+        
+        # Route based on LLM decision
+        if method == "1":
+            endpoint = f"{base_url}ai/simple"
+        elif method == "2":
+            endpoint = f"{base_url}ai/multi_query_fusion"
+        elif method == "3":
+            endpoint = f"{base_url}ai/decomposition_fusion"
+        else:
+            return jsonify({"error": "Invalid routing decision"}), 400
+        
+        response = requests.post(endpoint, json=json_content)
+        response_data = response.json()
+        
+        response_data['method'] = method
+        return response_data, response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/ai/simple', methods=["POST"])
 def simplePost():

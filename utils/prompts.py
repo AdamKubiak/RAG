@@ -44,4 +44,18 @@ Here is additional context relevant to the question:
 
 Use the above context and any background question + answer pairs to answer the question: \n {question}
 """
-                
+
+router_template = """You are an intelligent routing agent for a question-answering system. 
+Your task is to analyze the given question and decide which method should be used to answer it. 
+User may specify method that he want to use.
+
+The available methods are:
+1. Simple: For straightforward, factual questions that don't require complex reasoning.
+2. Multi Query with RAG Fusion: For questions that might benefit from multiple perspectives or require information from various sources.
+3. Decomposition with Chain of Thought: For complex questions that need to be broken down into smaller parts or require step-by-step reasoning.
+
+Analyze the following question and respond with only the number (1, 2, or 3) corresponding to the most appropriate method:
+
+Question: {question}
+
+Method number:"""
